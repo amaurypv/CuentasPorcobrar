@@ -1,10 +1,18 @@
+
 import os
 import xml.etree.ElementTree as ET
 import pandas as pd
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-def obtener_folios_pagados_manualmente(csv_path="pagadas_manual.csv"):
+# Ruta del directorio donde está este script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+def obtener_folios_pagados_manualmente():
+    # Ruta absoluta del directorio del script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, "pagadas_manual.csv")
+
     if not os.path.exists(csv_path):
         return set()
     try:
@@ -13,7 +21,7 @@ def obtener_folios_pagados_manualmente(csv_path="pagadas_manual.csv"):
     except Exception as e:
         print(f"Error leyendo el archivo CSV de pagos manuales: {e}")
         return set()
-
+    
 def obtener_uuids_pagados(carpeta_complementos):
     ns = {
         'cfdi': 'http://www.sat.gob.mx/cfd/4',
@@ -33,7 +41,22 @@ def obtener_uuids_pagados(carpeta_complementos):
                         uuids_pagados.add(uuid.upper())
             except Exception as e:
                 print(f"Error procesando complemento {archivo}: {e}")
+    # print(f"🟢 UUIDs encontrados en complementos:\n{uuids_pagados}")
     return uuids_pagados
+
+def convertir_a_dias(condiciones):
+    condiciones = condiciones.strip().lower()
+    if "semana" in condiciones:
+        for palabra in condiciones.split():
+            if palabra.isdigit():
+                return int(palabra) * 7
+            elif palabra in ["una", "un"]:
+                return 7
+        return 14
+    try:
+        return int(condiciones.split()[0])
+    except:
+        return 0
 
 def procesar_facturas_emitidas(carpeta_facturas, uuids_pagados, folios_pagados_manual):
     ns = {
@@ -51,7 +74,6 @@ def procesar_facturas_emitidas(carpeta_facturas, uuids_pagados, folios_pagados_m
                 root = tree.getroot()
                 comprobante = root
 
-                # Filtrar los complementos de pago
                 if comprobante.attrib.get("TipoDeComprobante", "").upper() != "I":
                     continue
 
@@ -69,17 +91,17 @@ def procesar_facturas_emitidas(carpeta_facturas, uuids_pagados, folios_pagados_m
                 cliente_rfc = receptor.attrib.get('Rfc', 'SIN RFC')
 
                 fecha_emision_dt = datetime.strptime(fecha_emision[:10], '%Y-%m-%d')
-                try:
-                    dias_credito = int(condiciones_pago.split()[0])
-                except ValueError:
-                    dias_credito = 0
+                dias_credito = convertir_a_dias(condiciones_pago)
                 fecha_vencimiento = fecha_emision_dt + timedelta(days=dias_credito)
                 hoy = datetime.now()
                 dias_por_vencer = (fecha_vencimiento - hoy).days
-
-                pagada = uuid in uuids_pagados or folio in folios_pagados_manual
-                vencida = dias_por_vencer < 0 and not pagada
-                estatus = "VENCIDA" if vencida else "POR PAGAR"
+                condiciones_es_contado = condiciones_pago.strip().lower() == "contado"
+                pagada = condiciones_es_contado or uuid in uuids_pagados or folio in folios_pagados_manual
+                if pagada:
+                    estatus = "PAGADA"
+                else:
+                    estatus = "VENCIDA" if dias_por_vencer < 0 else "POR PAGAR"
+                vencida = estatus == "VENCIDA"
 
                 total_mxn = total if not pagada and moneda == "MXN" else 0
                 total_usd = total if not pagada and moneda == "USD" else 0
@@ -125,12 +147,29 @@ def procesar_facturas_emitidas(carpeta_facturas, uuids_pagados, folios_pagados_m
 
             except Exception as e:
                 print(f"Error procesando factura {archivo}: {e}")
-
     return detalles_por_cliente, resumen_clientes
 
+def generar_hoja_vencidas_y_proximas(detalles_por_cliente):
+    registros = []
+    for (cliente, _), facturas in detalles_por_cliente.items():
+        for factura in facturas:
+            dias = factura["Días por Vencer / Vencidos"]
+            estatus = factura["Estatus"]
+            if estatus == "VENCIDA" or (estatus == "POR PAGAR" and dias <= 7):
+                registros.append({
+                    "Cliente": cliente,
+                    "Días vencidos / por vencer": dias,
+                    "Fecha de Vencimiento": factura["Fecha de Vencimiento"],
+                    "Número de Factura": factura["Folio"],
+                    "Total": factura["Total Factura"],
+                    "Moneda": factura["Moneda"]
+                })
+    return pd.DataFrame(registros)
+
 def generar_excel(carpeta_facturas, carpeta_complementos):
-    hoy = datetime.now().strftime("%d-%m-%Y")
-    archivo_salida = f"/Users/amauryperezverdejo/Library/CloudStorage/OneDrive-Personal/DOCUMENTOS GUBA/GUBA/cuentas_clientes_{hoy}.xlsx"
+    hoy = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    archivo_salida = f"/Users/amauryperezverdejo/Downloads/cuentas_clientes_{hoy}.xlsx"
+
 
     folios_pagados_manual = obtener_folios_pagados_manualmente()
     uuids_pagados = obtener_uuids_pagados(carpeta_complementos)
@@ -174,13 +213,18 @@ def generar_excel(carpeta_facturas, carpeta_complementos):
 
         hojas_clientes[hoja_nombre] = df
 
+    hoja_alertas = generar_hoja_vencidas_y_proximas(detalles_por_cliente)
+
     with pd.ExcelWriter(archivo_salida, engine='xlsxwriter') as writer:
+        hoja_alertas.to_excel(writer, sheet_name="Alertas Vencimientos", index=False)
         pd.DataFrame(resumen_data).to_excel(writer, sheet_name="Resumen", index=False)
         for hoja, df in hojas_clientes.items():
             df.to_excel(writer, sheet_name=hoja, index=False)
 
-    print(f"Archivo generado: {archivo_salida}")
+    print(f"✅ Archivo generado: {archivo_salida}")
 
 if __name__ == "__main__":
-    generar_excel("/Users/amauryperezverdejo/Library/CloudStorage/OneDrive-Personal/DOCUMENTOS GUBA/FACTURAS GUBA/FACTURAS 2025", 
-                   "/Users/amauryperezverdejo/Library/CloudStorage/OneDrive-Personal/DOCUMENTOS GUBA/FACTURAS GUBA/FACTURAS 2025")
+    generar_excel(
+        "/Users/amauryperezverdejo/Library/CloudStorage/OneDrive-Personal/DOCUMENTOS GUBA/FACTURAS GUBA/FACTURAS 2025",
+        "/Users/amauryperezverdejo/Library/CloudStorage/OneDrive-Personal/DOCUMENTOS GUBA/FACTURAS GUBA/FACTURAS 2025"
+    )
